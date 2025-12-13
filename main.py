@@ -2,8 +2,9 @@ import os
 import asyncio
 import base64
 import time
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from motor.motor_asyncio import AsyncIOMotorClient
+from aiohttp import web
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID"))
@@ -21,11 +22,29 @@ config_col = db["config"]
 
 app = Client("file_store_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+async def init_db():
+    # Only needed if you have specific setup logic, otherwise pass
+    pass
+
+# --- WEB SERVER (To Fix Render Port Error) ---
+async def web_server():
+    async def handle(request):
+        return web.Response(text="Bot is Running Successfully!")
+
+    web_app = web.Application()
+    web_app.add_routes([web.get('/', handle)])
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web Server Started on Port {port}")
+
 # --- DATABASE FUNCTIONS ---
 
 async def get_delete_time():
     data = await config_col.find_one({"key": "del_time"})
-    return data["value"] if data else 600 # Default 10 mins
+    return data["value"] if data else 600 
 
 async def set_delete_time(seconds):
     await config_col.update_one(
@@ -70,7 +89,6 @@ async def start_command(client, message):
         try:
             unique_id = decode_payload(payload)
             msg_id = await get_file(unique_id)
-            
             if msg_id:
                 try:
                     await client.copy_message(
@@ -101,27 +119,21 @@ async def set_time_handler(client, message):
 @app.on_message((filters.document | filters.video | filters.photo | filters.audio) & filters.private)
 async def file_handler(client, message):
     status_msg = await message.reply("📤 Uploading...")
-    
     try:
         forwarded = await message.forward(CHANNEL_ID)
-        
         msg_id = forwarded.id
         unique_id = f"file_{msg_id}"
         encoded_link = encode_payload(unique_id)
         bot_username = (await client.get_me()).username
         link = f"https://t.me/{bot_username}?start={encoded_link}"
-        
         del_seconds = await get_delete_time()
         delete_at = int(time.time()) + del_seconds
-        
         await add_file(unique_id, msg_id, delete_at)
-        
         await status_msg.edit(
             f"✅ **File Stored!**\n\n"
             f"🔗 **Link:** {link}\n\n"
             f"⏳ **Expires in:** {int(del_seconds/60)} minutes."
         )
-        
     except Exception as e:
         await status_msg.edit(f"❌ Error: {e}")
 
@@ -140,8 +152,17 @@ async def auto_delete_loop():
         except: pass  
         await asyncio.sleep(60)
 
+# --- MAIN EXECUTION ---
+async def main():
+    await init_db()
+    print("Starting Web Server & Bot...")
+    await web_server()
+    await app.start()
+    print("Bot Started!")
+    asyncio.create_task(auto_delete_loop())
+    await idle()
+    await app.stop()
+
 if __name__ == "__main__":
-    print("Bot Starting...")
     loop = asyncio.get_event_loop()
-    loop.create_task(auto_delete_loop())
-    app.run()
+    loop.run_until_complete(main())
