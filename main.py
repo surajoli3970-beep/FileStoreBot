@@ -2,25 +2,48 @@ import os
 import asyncio
 import base64
 import time
+import logging
+import sys
 from pyrogram import Client, filters, idle
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
 
-# --- CONFIGURATION ---
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
-ADMIN_ID = int(os.environ.get("ADMIN_ID"))
-MONGO_URL = os.environ.get("MONGO_URL")
+# --- LOGGING SETUP (Error dekhne ke liye) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# --- CONFIGURATION CHECK ---
+try:
+    API_ID = int(os.environ.get("API_ID"))
+    API_HASH = os.environ.get("API_HASH")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN")
+    CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
+    ADMIN_ID = int(os.environ.get("ADMIN_ID"))
+    MONGO_URL = os.environ.get("MONGO_URL")
+    
+    if not all([API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, ADMIN_ID, MONGO_URL]):
+        raise ValueError("Kuch Environment Variables Missing hain!")
+except Exception as e:
+    logger.error(f"Configuration Error: {e}")
+    logger.error("Render par 'Environment' tab check karein. Values missing hain.")
+    sys.exit(1)
 
 # Connection to MongoDB
-mongo_client = AsyncIOMotorClient(MONGO_URL)
-db = mongo_client["filestore_bot"]
-
-files_col = db["files"]
-active_col = db["active_files"] 
-config_col = db["config"]
+try:
+    mongo_client = AsyncIOMotorClient(MONGO_URL)
+    db = mongo_client["filestore_bot"]
+    files_col = db["files"]
+    active_col = db["active_files"] 
+    config_col = db["config"]
+    # Test connection
+    mongo_client.server_info()
+    logger.info("MongoDB Connected Successfully!")
+except Exception as e:
+    logger.error(f"MongoDB Connection Failed: {e}")
+    sys.exit(1)
 
 app = Client("file_store_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -42,7 +65,7 @@ async def web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"Web Server Started on Port {port}")
+    logger.info(f"Web Server Started on Port {port}")
 
 # --- DATABASE FUNCTIONS ---
 
@@ -102,46 +125,38 @@ async def start_command(client, message):
             
             if file_data:
                 msg_ids = file_data.get("message_ids")
-                
                 if not isinstance(msg_ids, list):
                     msg_ids = [msg_ids]
 
                 try:
                     loading_msg = await message.reply(f"📂 **Processing {len(msg_ids)} file(s)...**")
-                    
                     del_seconds = await get_delete_time()
                     delete_at = int(time.time()) + del_seconds
                     
-                    sent_files = []
-                    
                     for mid in msg_ids:
-                        # FIX: caption parameter hata diya taaki original caption copy ho
+                        # Caption parameter hata diya taaki original caption aaye
                         sent = await client.copy_message(
                             chat_id=message.chat.id,
                             from_chat_id=CHANNEL_ID,
                             message_id=int(mid)
                         )
-                        sent_files.append(sent.id)
                         await add_active_file(message.chat.id, sent.id, delete_at)
-                        await asyncio.sleep(0.5) # Floodwait prevention
+                        await asyncio.sleep(0.5)
 
-                    # Delete loading message
                     await loading_msg.delete()
-
-                    # Warning Message alag se bhejenge
                     warning = await message.reply(
-                        f"⏳ **Alert:** Upar di gayi files {int(del_seconds/60)} minutes mein delete ho jayengi.\n\n"
+                        f"⏳ **Alert:** Files {int(del_seconds/60)} minutes mein delete ho jayengi.\n\n"
                         f"🛑 **Forward ya Save kar lein!**"
                     )
                     await add_active_file(message.chat.id, warning.id, delete_at)
 
                 except Exception as e:
-                    print(e)
+                    logger.error(f"Error sending file: {e}")
                     await message.reply("❌ Error sending files. Maybe deleted from channel.")
             else:
                 await message.reply("❌ Link expired or invalid.")
         except Exception as e:
-            print(e)
+            logger.error(f"Link Error: {e}")
             await message.reply("❌ Invalid Link.")
     else:
         await message.reply("👋 Welcome! Send files or text to store.")
@@ -156,26 +171,21 @@ async def set_time_handler(client, message):
     except:
         await message.reply("❌ Usage: `/settime 10`")
 
-# --- BATCH MODE COMMANDS ---
+# --- BATCH MODE ---
 
 @app.on_message(filters.command("batch") & filters.user(ADMIN_ID))
 async def batch_start(client, message):
     batch_data[message.from_user.id] = []
-    await message.reply(
-        "🚀 **Batch Mode Started!**\n\n"
-        "Ab files, videos, ya TEXT messages bhejein.\n"
-        "Jab sab ho jaye, **/done** click karein."
-    )
+    await message.reply("🚀 **Batch Mode Started!**\nSend files/text. Type **/done** when finished.")
 
 @app.on_message(filters.command("done") & filters.user(ADMIN_ID))
 async def batch_done(client, message):
     user_id = message.from_user.id
     if user_id not in batch_data or not batch_data[user_id]:
-        await message.reply("❌ List empty hai! Pehle `/batch` start karein aur kuch bhejein.")
+        await message.reply("❌ List empty!")
         return
 
     msg_ids = batch_data[user_id]
-    
     unique_id = f"batch_{int(time.time())}_{user_id}"
     encoded_link = encode_payload(unique_id)
     bot_username = (await client.get_me()).username
@@ -185,16 +195,9 @@ async def batch_done(client, message):
     del batch_data[user_id]
     
     del_seconds = await get_delete_time()
-    await message.reply(
-        f"✅ **Batch Created!**\n"
-        f"📂 Total Messages: {len(msg_ids)}\n\n"
-        f"🔗 **Link:** {link}\n\n"
-        f"⏳ User Expiry: {int(del_seconds/60)} minutes."
-    )
+    await message.reply(f"✅ **Batch Created!**\n🔗 **Link:** {link}\n⏳ Expiry: {int(del_seconds/60)} mins.")
 
-# --- FILE & TEXT HANDLER ---
-
-# FIX: Added filters.text and excluded commands
+# --- CONTENT HANDLER (TEXT FIX) ---
 @app.on_message(
     (filters.document | filters.video | filters.photo | filters.audio | filters.text) 
     & ~filters.command 
@@ -204,21 +207,18 @@ async def content_handler(client, message):
     if message.from_user.id != ADMIN_ID:
         return 
 
-    # Batch Mode Logic
     if message.from_user.id in batch_data:
         try:
             forwarded = await message.forward(CHANNEL_ID)
             batch_data[message.from_user.id].append(forwarded.id)
         except Exception as e:
-            await message.reply(f"❌ Error storing message: {e}")
+            await message.reply(f"❌ Error: {e}")
         return
 
-    # Single Mode Logic
     status_msg = await message.reply("📤 **Storing...**")
     try:
         forwarded = await message.forward(CHANNEL_ID)
         msg_id = forwarded.id
-        
         unique_id = f"file_{msg_id}"
         encoded_link = encode_payload(unique_id)
         bot_username = (await client.get_me()).username
@@ -226,12 +226,7 @@ async def content_handler(client, message):
         
         await add_file(unique_id, [msg_id], is_batch=False)
         del_seconds = await get_delete_time()
-        
-        await status_msg.edit(
-            f"✅ **Stored!**\n\n"
-            f"🔗 **Link:** {link}\n"
-            f"⏳ Expiry: {int(del_seconds/60)} mins."
-        )
+        await status_msg.edit(f"✅ **Stored!**\n🔗 {link}\n⏳ {int(del_seconds/60)} mins.")
     except Exception as e:
         await status_msg.edit(f"❌ Error: {e}")
 
@@ -252,10 +247,10 @@ async def auto_delete_loop():
 # --- MAIN ---
 async def main():
     await init_db()
-    print("Starting...")
+    logger.info("Starting Web Server & Bot...")
     await web_server()
     await app.start()
-    print("Bot Started!")
+    logger.info("Bot Started Successfully!")
     asyncio.create_task(auto_delete_loop())
     await idle()
     await app.stop()
