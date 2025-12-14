@@ -8,7 +8,7 @@ from pyrogram import Client, filters, idle
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
 
-# --- LOGGING SETUP (Error dekhne ke liye) ---
+# --- LOGGING SETUP ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -28,7 +28,6 @@ try:
         raise ValueError("Kuch Environment Variables Missing hain!")
 except Exception as e:
     logger.error(f"Configuration Error: {e}")
-    logger.error("Render par 'Environment' tab check karein. Values missing hain.")
     sys.exit(1)
 
 # Connection to MongoDB
@@ -38,8 +37,6 @@ try:
     files_col = db["files"]
     active_col = db["active_files"] 
     config_col = db["config"]
-    # Test connection
-    mongo_client.server_info()
     logger.info("MongoDB Connected Successfully!")
 except Exception as e:
     logger.error(f"MongoDB Connection Failed: {e}")
@@ -134,7 +131,6 @@ async def start_command(client, message):
                     delete_at = int(time.time()) + del_seconds
                     
                     for mid in msg_ids:
-                        # Caption parameter hata diya taaki original caption aaye
                         sent = await client.copy_message(
                             chat_id=message.chat.id,
                             from_chat_id=CHANNEL_ID,
@@ -197,13 +193,16 @@ async def batch_done(client, message):
     del_seconds = await get_delete_time()
     await message.reply(f"✅ **Batch Created!**\n🔗 **Link:** {link}\n⏳ Expiry: {int(del_seconds/60)} mins.")
 
-# --- CONTENT HANDLER (TEXT FIX) ---
+# --- CONTENT HANDLER (FIXED) ---
 @app.on_message(
     (filters.document | filters.video | filters.photo | filters.audio | filters.text) 
-    & ~filters.command 
     & filters.private
 )
 async def content_handler(client, message):
+    # Ignore commands (Fix for the crash)
+    if message.command:
+        return
+
     if message.from_user.id != ADMIN_ID:
         return 
 
