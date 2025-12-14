@@ -18,13 +18,14 @@ MONGO_URL = os.environ.get("MONGO_URL")
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["filestore_bot"]
 
-# Collection 1: Permanent Link Store (Ye kabhi delete nahi hoga)
 files_col = db["files"]
-# Collection 2: Temporary User Messages (Ye time aane par delete honge)
 active_col = db["active_files"] 
 config_col = db["config"]
 
 app = Client("file_store_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Temporary storage for batch mode (RAM mein rahega)
+batch_data = {}
 
 async def init_db():
     pass
@@ -47,7 +48,7 @@ async def web_server():
 
 async def get_delete_time():
     data = await config_col.find_one({"key": "del_time"})
-    return data["value"] if data else 600  # Default 10 minutes
+    return data["value"] if data else 600 
 
 async def set_delete_time(seconds):
     await config_col.update_one(
@@ -56,19 +57,17 @@ async def set_delete_time(seconds):
         upsert=True
     )
 
-# 1. File ko Permanent store karne ke liye (Channel Info)
-async def add_file(unique_id, message_id):
-    # Yahan delete_at hata diya, kyunki channel se delete nahi karna hai
+async def add_file(unique_id, message_ids, is_batch=False):
+    # message_ids ab list [] ho sakta hai
     await files_col.insert_one({
         "unique_id": unique_id,
-        "message_id": message_id
+        "message_ids": message_ids, # List of IDs stored here
+        "is_batch": is_batch
     })
 
 async def get_file(unique_id):
-    data = await files_col.find_one({"unique_id": unique_id})
-    return data["message_id"] if data else None
+    return await files_col.find_one({"unique_id": unique_id})
 
-# 2. User ko bheji gayi file track karne ke liye (Temporary Info)
 async def add_active_file(user_id, message_id, delete_at):
     await active_col.insert_one({
         "user_id": user_id,
@@ -78,7 +77,6 @@ async def add_active_file(user_id, message_id, delete_at):
 
 async def get_expired_active_files():
     now = int(time.time())
-    # Sirf wo files dhundo jinka time khatam ho gaya hai
     cursor = active_col.find({"delete_at": {"$lt": now}})
     return await cursor.to_list(length=100)
 
@@ -101,43 +99,55 @@ async def start_command(client, message):
         payload = message.command[1]
         try:
             unique_id = decode_payload(payload)
-            channel_msg_id = await get_file(unique_id)
+            file_data = await get_file(unique_id)
             
-            if channel_msg_id:
+            if file_data:
+                msg_ids = file_data.get("message_ids")
+                is_batch = file_data.get("is_batch", False)
+                
+                # Agar single ID hai to list bana lo (compatibility ke liye)
+                if not isinstance(msg_ids, list):
+                    msg_ids = [msg_ids]
+
                 try:
-                    # 1. File copy karo user ko
-                    sent_msg = await client.copy_message(
-                        chat_id=message.chat.id,
-                        from_chat_id=CHANNEL_ID,
-                        message_id=int(channel_msg_id),
-                        caption=f"📂 **File Delivered!**\n\n⚠️ __Note: Security reasons ki wajah se ye file auto-delete ho jayegi.__\n📥 __Jaldi save/forward kar lein.__"
-                    )
+                    await message.reply(f"📂 **Processing {len(msg_ids)} file(s)...**")
                     
-                    # 2. Delete time calculate karo
                     del_seconds = await get_delete_time()
                     delete_at = int(time.time()) + del_seconds
                     
-                    # 3. User ko warning message bhejo
-                    warning_msg = await message.reply(
-                        f"⏳ **Alert:** Ye file {int(del_seconds/60)} minute(s) mein delete ho jayegi.\n\n"
-                        f"🛑 **Forward ya Save kar lein agar zaroorat hai.**"
-                    )
+                    sent_files = []
                     
-                    # 4. DB mein note kar lo ki is user ke message ko delete karna hai
-                    # Hum file aur warning message dono ko track kar sakte hain
-                    await add_active_file(message.chat.id, sent_msg.id, delete_at)
-                    await add_active_file(message.chat.id, warning_msg.id, delete_at)
+                    for mid in msg_ids:
+                        # Copy message from channel to user
+                        sent = await client.copy_message(
+                            chat_id=message.chat.id,
+                            from_chat_id=CHANNEL_ID,
+                            message_id=int(mid),
+                            caption="" if is_batch else "⚠️ __Auto-delete enabled.__"
+                        )
+                        sent_files.append(sent.id)
+                        # Add to deletion schedule
+                        await add_active_file(message.chat.id, sent.id, delete_at)
+                        # FloodWait se bachne ke liye thoda wait
+                        await asyncio.sleep(0.5)
+
+                    # Warning Message
+                    warning = await message.reply(
+                        f"⏳ **Alert:** Ye {len(msg_ids)} files {int(del_seconds/60)} minutes mein delete ho jayengi.\n\n"
+                        f"🛑 **Jaldi Save/Forward kar lein!**"
+                    )
+                    await add_active_file(message.chat.id, warning.id, delete_at)
 
                 except Exception as e:
                     print(e)
-                    await message.reply("❌ File not found (Maybe deleted from database).")
+                    await message.reply("❌ Error sending files. Maybe deleted from channel.")
             else:
                 await message.reply("❌ Link expired or invalid.")
         except Exception as e:
             print(e)
             await message.reply("❌ Invalid Link.")
     else:
-        await message.reply("👋 Welcome! Send me any file to store safely.")
+        await message.reply("👋 Welcome! Use /batch to upload multiple files.")
 
 @app.on_message(filters.command("settime") & filters.user(ADMIN_ID))
 async def set_time_handler(client, message):
@@ -147,69 +157,106 @@ async def set_time_handler(client, message):
         await set_delete_time(seconds)
         await message.reply(f"✅ User Auto-delete time set to {minutes} minutes.")
     except:
-        await message.reply("❌ Usage: `/settime 10` (for 10 minutes)")
+        await message.reply("❌ Usage: `/settime 10`")
+
+# --- BATCH MODE COMMANDS ---
+
+@app.on_message(filters.command("batch") & filters.user(ADMIN_ID))
+async def batch_start(client, message):
+    batch_data[message.from_user.id] = []
+    await message.reply(
+        "🚀 **Batch Mode Started!**\n\n"
+        "Ab aap jitni chahein files (Audio, Video, Doc) bhejein.\n"
+        "Jab sab upload ho jaye, tab **/done** click karein."
+    )
+
+@app.on_message(filters.command("done") & filters.user(ADMIN_ID))
+async def batch_done(client, message):
+    user_id = message.from_user.id
+    if user_id not in batch_data or not batch_data[user_id]:
+        await message.reply("❌ Aapne koi file nahi bheji! Pehle `/batch` start karein.")
+        return
+
+    msg_ids = batch_data[user_id]
+    
+    # Generate Link for Batch
+    unique_id = f"batch_{int(time.time())}_{user_id}"
+    encoded_link = encode_payload(unique_id)
+    bot_username = (await client.get_me()).username
+    link = f"https://t.me/{bot_username}?start={encoded_link}"
+    
+    # Save to DB
+    await add_file(unique_id, msg_ids, is_batch=True)
+    
+    # Clear memory
+    del batch_data[user_id]
+    
+    del_seconds = await get_delete_time()
+    await message.reply(
+        f"✅ **Batch Created Successfully!**\n"
+        f"📂 Total Files: {len(msg_ids)}\n\n"
+        f"🔗 **Link:** {link}\n\n"
+        f"⏳ User Expiry: {int(del_seconds/60)} minutes."
+    )
+
+# --- FILE HANDLER ---
 
 @app.on_message((filters.document | filters.video | filters.photo | filters.audio) & filters.private)
 async def file_handler(client, message):
-    # Sirf Admin hi file add kar sake (Optional security)
     if message.from_user.id != ADMIN_ID:
         return 
 
-    status_msg = await message.reply("📤 **Storing in Private Channel...**")
+    # Check if user is in batch mode
+    if message.from_user.id in batch_data:
+        try:
+            forwarded = await message.forward(CHANNEL_ID)
+            batch_data[message.from_user.id].append(forwarded.id)
+            # User ko feedback na dein taaki spam na ho, bas chupchap add karein
+        except Exception as e:
+            await message.reply(f"❌ Error storing file: {e}")
+        return
+
+    # Normal Single File Mode
+    status_msg = await message.reply("📤 **Storing Single File...**")
     try:
-        # 1. Channel mein forward karo (Permanent Storage)
         forwarded = await message.forward(CHANNEL_ID)
         msg_id = forwarded.id
         
-        # 2. Link Generate karo
         unique_id = f"file_{msg_id}"
         encoded_link = encode_payload(unique_id)
         bot_username = (await client.get_me()).username
         link = f"https://t.me/{bot_username}?start={encoded_link}"
         
-        # 3. Database mein save karo (Bina expiry ke)
-        await add_file(unique_id, msg_id)
+        await add_file(unique_id, [msg_id], is_batch=False)
         
         del_seconds = await get_delete_time()
         
         await status_msg.edit(
-            f"✅ **File Stored Permanently!**\n\n"
-            f"🔗 **Link:** {link}\n\n"
-            f"ℹ️ **Info:** User ke liye ye file {int(del_seconds/60)} minutes baad auto-delete hogi, par link hamesha work karega."
+            f"✅ **Single File Stored!**\n\n"
+            f"🔗 **Link:** {link}\n"
+            f"⏳ Expiry: {int(del_seconds/60)} mins."
         )
     except Exception as e:
         await status_msg.edit(f"❌ Error: {e}")
 
-# --- AUTO DELETE LOOP (Modified for Users) ---
+# --- AUTO DELETE LOOP ---
 async def auto_delete_loop():
     while True:
         try:
-            # Expired files user ke chat se dhundo
             expired_files = await get_expired_active_files()
-            
             if expired_files:
                 for file_data in expired_files:
-                    user_id = file_data["user_id"]
-                    msg_id = file_data["message_id"]
-                    
                     try:
-                        # User ke chat se delete karo
-                        await app.delete_messages(user_id, msg_id)
-                    except Exception as e:
-                        # Agar user ne bot block kiya ho ya message already delete ho
-                        pass
-                    
-                    # DB se entry hata do taaki loop baar baar try na kare
-                    await delete_active_entry(msg_id)
-        except Exception as e:
-            print(f"Error in Auto Delete Loop: {e}")
-            
+                        await app.delete_messages(file_data["user_id"], file_data["message_id"])
+                    except: pass
+                    await delete_active_entry(file_data["message_id"])
+        except: pass    
         await asyncio.sleep(60)
 
-# --- MAIN EXECUTION ---
+# --- MAIN ---
 async def main():
     await init_db()
-    print("Starting Web Server & Bot...")
+    print("Starting...")
     await web_server()
     await app.start()
     print("Bot Started!")
