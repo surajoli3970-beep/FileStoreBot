@@ -77,6 +77,21 @@ async def set_delete_time(seconds):
         upsert=True
     )
 
+# New: Custom Message Fetch
+async def get_alert_msg():
+    data = await config_col.find_one({"key": "alert_msg"})
+    # Default Message agar set nahi kiya hai
+    default_msg = "⏳ **Alert:** Ye file {time} minutes mein delete ho jayegi.\n\n🛑 **Jaldi Forward ya Save kar lein!**"
+    return data["value"] if data else default_msg
+
+# New: Custom Message Set
+async def set_alert_msg(msg):
+    await config_col.update_one(
+        {"key": "alert_msg"}, 
+        {"$set": {"value": msg}}, 
+        upsert=True
+    )
+
 async def add_file(unique_id, message_ids, is_batch=False):
     await files_col.insert_one({
         "unique_id": unique_id,
@@ -130,6 +145,10 @@ async def start_command(client, message):
                     del_seconds = await get_delete_time()
                     delete_at = int(time.time()) + del_seconds
                     
+                    # Custom Message Tayar karo
+                    raw_alert = await get_alert_msg()
+                    formatted_alert = raw_alert.replace("{time}", str(int(del_seconds/60)))
+
                     for mid in msg_ids:
                         sent = await client.copy_message(
                             chat_id=message.chat.id,
@@ -140,10 +159,9 @@ async def start_command(client, message):
                         await asyncio.sleep(0.5)
 
                     await loading_msg.delete()
-                    warning = await message.reply(
-                        f"⏳ **Alert:** Files {int(del_seconds/60)} minutes mein delete ho jayengi.\n\n"
-                        f"🛑 **Forward ya Save kar lein!**"
-                    )
+                    
+                    # Send Custom Alert Message
+                    warning = await message.reply(formatted_alert)
                     await add_active_file(message.chat.id, warning.id, delete_at)
 
                 except Exception as e:
@@ -155,7 +173,9 @@ async def start_command(client, message):
             logger.error(f"Link Error: {e}")
             await message.reply("❌ Invalid Link.")
     else:
-        await message.reply("👋 Welcome! Send files or text to store.")
+        await message.reply("👋 Welcome! Send multiple files to get links instantly.")
+
+# --- SETTINGS COMMANDS ---
 
 @app.on_message(filters.command("settime") & filters.user(ADMIN_ID))
 async def set_time_handler(client, message):
@@ -167,12 +187,32 @@ async def set_time_handler(client, message):
     except:
         await message.reply("❌ Usage: `/settime 10`")
 
-# --- BATCH MODE ---
+# NEW COMMAND: Custom Message Set Karne ke liye
+@app.on_message(filters.command("setalert") & filters.user(ADMIN_ID))
+async def set_alert_handler(client, message):
+    # Check if message has text
+    if len(message.command) < 2:
+        await message.reply(
+            "❌ **Message likhna bhool gaye!**\n\n"
+            "Usage Example:\n"
+            "`/setalert Ye file {time} minutes mein delete hogi.`\n\n"
+            "Note: `{time}` likhna zaroori hai, wahan automatic minutes aa jayenge."
+        )
+        return
+
+    # Command ke baad ka saara text utha lo
+    new_msg = message.text.split(None, 1)[1]
+    
+    await set_alert_msg(new_msg)
+    await message.reply(f"✅ **New Alert Message Saved!**\n\nPreview:\n{new_msg}")
+
+
+# --- BATCH MODE (One Link for Many Files) ---
 
 @app.on_message(filters.command("batch") & filters.user(ADMIN_ID))
 async def batch_start(client, message):
     batch_data[message.from_user.id] = []
-    await message.reply("🚀 **Batch Mode Started!**\nSend files/text. Type **/done** when finished.")
+    await message.reply("🚀 **Batch Mode Started!**\nSend files. Type **/done** for a single link.")
 
 @app.on_message(filters.command("done") & filters.user(ADMIN_ID))
 async def batch_done(client, message):
@@ -193,19 +233,17 @@ async def batch_done(client, message):
     del_seconds = await get_delete_time()
     await message.reply(f"✅ **Batch Created!**\n🔗 **Link:** {link}\n⏳ Expiry: {int(del_seconds/60)} mins.")
 
-# --- CONTENT HANDLER (FIXED) ---
+# --- CONTENT HANDLER (SINGLE LINKS PER FILE) ---
 @app.on_message(
     (filters.document | filters.video | filters.photo | filters.audio | filters.text) 
     & filters.private
 )
 async def content_handler(client, message):
-    # Ignore commands (Fix for the crash)
-    if message.command:
-        return
+    if message.command: return # Ignore commands
 
-    if message.from_user.id != ADMIN_ID:
-        return 
+    if message.from_user.id != ADMIN_ID: return 
 
+    # Agar Batch Mode ON hai to wahan collect karo
     if message.from_user.id in batch_data:
         try:
             forwarded = await message.forward(CHANNEL_ID)
@@ -214,7 +252,9 @@ async def content_handler(client, message):
             await message.reply(f"❌ Error: {e}")
         return
 
-    status_msg = await message.reply("📤 **Storing...**")
+    # Normal Mode: Har file ka ALAG Link banega
+    # User ko 'reply' nahi karte warna flood ho jayega agar 20 file bheji to.
+    # Hum bas Link bhejenge.
     try:
         forwarded = await message.forward(CHANNEL_ID)
         msg_id = forwarded.id
@@ -224,10 +264,12 @@ async def content_handler(client, message):
         link = f"https://t.me/{bot_username}?start={encoded_link}"
         
         await add_file(unique_id, [msg_id], is_batch=False)
-        del_seconds = await get_delete_time()
-        await status_msg.edit(f"✅ **Stored!**\n🔗 {link}\n⏳ {int(del_seconds/60)} mins.")
+        
+        # Simple response taaki user 20 file bheje to spam na lage
+        await message.reply(f"🔗 {link}", quote=True)
+        
     except Exception as e:
-        await status_msg.edit(f"❌ Error: {e}")
+        await message.reply(f"❌ Error: {e}")
 
 # --- AUTO DELETE LOOP ---
 async def auto_delete_loop():
