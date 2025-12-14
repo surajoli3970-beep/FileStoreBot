@@ -3,3 +3,4 @@ tgcrypto
 motor
 dnspython
 aiohttp
+uvloop
