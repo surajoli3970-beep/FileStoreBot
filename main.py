@@ -196,13 +196,19 @@ async def set_alert_handler(client, message):
 @app.on_message(filters.command("batch") & filters.user(ADMIN_ID))
 async def batch_start(client, message):
     batch_data[message.from_user.id] = []
-    await message.reply("🚀 **Batch Mode Started!**\nSend files. Type **/done** for a single link.")
+    await message.reply("🚀 **Batch Mode Started!**\n\n1. Files Forward karein.\n2. **'✅ Added'** ka wait karein.\n3. Fir **/done** dabayein.")
 
 @app.on_message(filters.command("done") & filters.user(ADMIN_ID))
 async def batch_done(client, message):
     user_id = message.from_user.id
-    if user_id not in batch_data or not batch_data[user_id]:
-        await message.reply("❌ List empty!")
+    
+    # Check if list exists but is empty
+    if user_id not in batch_data:
+        await message.reply("❌ Pehle `/batch` start karein.")
+        return
+        
+    if not batch_data[user_id]:
+        await message.reply("❌ **List Empty hai!**\n\nPossible Reasons:\n1. Aapne `/done` bahut jaldi daba diya (Upload finish nahi hua).\n2. Aapne 'Restricted Content' forward kiya jo Bot save nahi kar sakta.")
         return
 
     msg_ids = batch_data[user_id]
@@ -211,41 +217,41 @@ async def batch_done(client, message):
     bot_username = (await client.get_me()).username
     link = f"https://t.me/{bot_username}?start={encoded_link}"
     
-    # Batch data clear karne se pehle save karo
     await add_file(unique_id, msg_ids, is_batch=True)
     del batch_data[user_id]
     
     del_seconds = await get_delete_time()
-    await message.reply(f"✅ **Batch Created!**\n🔗 **Link:** {link}\n⏳ Expiry: {int(del_seconds/60)} mins.")
+    await message.reply(f"✅ **Batch Created!**\n📂 Total Files: {len(msg_ids)}\n🔗 **Link:** {link}\n⏳ Expiry: {int(del_seconds/60)} mins.")
 
-# --- CONTENT HANDLER (FIXED FOR RACE CONDITION) ---
+# --- CONTENT HANDLER (SMART FEEDBACK) ---
 @app.on_message(
     (filters.document | filters.video | filters.photo | filters.audio | filters.text) 
     & filters.private
 )
 async def content_handler(client, message):
-    # Commands ko ignore karo
     if message.command: return 
 
     if message.from_user.id != ADMIN_ID: return 
 
-    # Agar Batch Mode ON hai
+    # BATCH MODE
     if message.from_user.id in batch_data:
         try:
+            # Step 1: Forwarding (Time taking process)
             forwarded = await message.forward(CHANNEL_ID)
             
-            # CRITICAL FIX: Check karo ki user abhi bhi batch mode mein hai ya nahi
+            # Step 2: Check if batch still exists
             if message.from_user.id in batch_data:
                 batch_data[message.from_user.id].append(forwarded.id)
+                # FEEDBACK: User ko batao ki file add ho gayi
+                await message.reply("✅ Added", quote=True)
             else:
-                # Agar /done daba diya gaya hai to ignore karo
-                pass
+                pass 
         except Exception as e:
-            # Error user ko mat dikhao, logs mein daalo
-            logger.error(f"Batch Error (Ignored): {e}")
+            logger.error(f"Batch Error: {e}")
+            await message.reply(f"❌ Failed to Add: {e}\n(Shayad Restricted Content hai)", quote=True)
         return
 
-    # Normal Mode (Single Link)
+    # NORMAL MODE (SINGLE LINK)
     try:
         forwarded = await message.forward(CHANNEL_ID)
         msg_id = forwarded.id
