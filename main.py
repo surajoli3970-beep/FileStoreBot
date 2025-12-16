@@ -80,10 +80,6 @@ async def set_alert_msg(msg):
     await config_col.update_one({"key": "alert_msg"}, {"$set": {"value": msg}}, upsert=True)
 
 async def add_file(unique_id, message_ids, is_batch=False):
-    # Sorting: Ye line order sahi karegi (Fix for Problem 1)
-    if isinstance(message_ids, list):
-        message_ids.sort()
-        
     await files_col.insert_one({
         "unique_id": unique_id,
         "message_ids": message_ids,
@@ -139,8 +135,7 @@ async def start_command(client, message):
                     formatted_alert = raw_alert.replace("{time}", str(int(del_seconds/60)))
 
                     for mid in msg_ids:
-                        # Fix for Problem 2: Thumbnail & Caption preserved
-                        # Hum sirf copy kar rahe hain, koi change nahi
+                        # THUMBNAIL FIX: Original message ko bina chhede copy karo
                         sent = await client.copy_message(
                             chat_id=message.chat.id,
                             from_chat_id=CHANNEL_ID,
@@ -181,36 +176,66 @@ async def set_alert_handler(client, message):
     await set_alert_msg(new_msg)
     await message.reply(f"✅ Alert Saved:\n{new_msg}")
 
-# --- BATCH MODE ---
+# --- BATCH MODE WITH NAME SORTING ---
 
 @app.on_message(filters.command("batch") & filters.user(ADMIN_ID))
 async def batch_start(client, message):
     batch_data[message.from_user.id] = []
-    await message.reply("🚀 **Batch Mode ON!**\nFiles bhejein. Jab sab par '✅ Added' aa jaye to **/done** dabayein.")
+    await message.reply("🚀 **Batch Mode ON!**\n\n1. Files Forward karein.\n2. **'✅ Added'** ka wait karein.\n3. Fir **/done** dabayein.")
 
 @app.on_message(filters.command("done") & filters.user(ADMIN_ID))
 async def batch_done(client, message):
     user_id = message.from_user.id
     if user_id not in batch_data or not batch_data[user_id]:
-        await message.reply("❌ Empty List!")
+        await message.reply("❌ List Empty! Pehle files bhejein.")
         return
 
     msg_ids = batch_data[user_id]
     
-    # FIX FOR PROBLEM 1: Sorting IDs
-    # Ye IDs ko 1, 2, 3 ke order mein laga dega
-    msg_ids.sort()
+    # --- NAME SORTING LOGIC START ---
+    status_msg = await message.reply("⚙️ **Sorting files by Name...**")
+    
+    try:
+        # Channel se actual messages fetch karo taaki naam padh sakein
+        msgs = await client.get_messages(CHANNEL_ID, msg_ids)
+        if not isinstance(msgs, list):
+            msgs = [msgs]
+            
+        # Helper function: File ka naam nikalne ke liye
+        def get_file_name(m):
+            if m.document and m.document.file_name: return m.document.file_name
+            if m.video and m.video.file_name: return m.video.file_name
+            if m.audio and m.audio.file_name: return m.audio.file_name
+            if m.caption: return m.caption # Agar file name nahi hai to caption use karo
+            return "" # Kuch nahi mila
+
+        # Sort karo (Alphabetical Order: A -> Z)
+        msgs_sorted = sorted(msgs, key=lambda m: get_file_name(m))
+        
+        # Ab naye sorted IDs nikalo
+        sorted_msg_ids = [m.id for m in msgs_sorted]
+    except Exception as e:
+        logger.error(f"Sort Error: {e}")
+        # Agar sorting fail ho jaye to normal ID sort use karo
+        sorted_msg_ids = sorted(msg_ids)
+
+    # --- NAME SORTING LOGIC END ---
 
     unique_id = f"batch_{int(time.time())}_{user_id}"
     encoded_link = encode_payload(unique_id)
     bot_username = (await client.get_me()).username
     link = f"https://t.me/{bot_username}?start={encoded_link}"
     
-    await add_file(unique_id, msg_ids, is_batch=True)
+    await add_file(unique_id, sorted_msg_ids, is_batch=True)
     del batch_data[user_id]
     
     del_seconds = await get_delete_time()
-    await message.reply(f"✅ **Batch Ready!**\n📂 Files: {len(msg_ids)}\n🔗 {link}\n⏳ Time: {int(del_seconds/60)} mins.")
+    await status_msg.edit(
+        f"✅ **Batch Created & Sorted!**\n"
+        f"📂 Total Files: {len(sorted_msg_ids)}\n"
+        f"🔗 **Link:** {link}\n"
+        f"⏳ Time: {int(del_seconds/60)} mins."
+    )
 
 # --- HANDLER ---
 
