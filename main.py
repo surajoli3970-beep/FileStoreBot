@@ -25,26 +25,25 @@ try:
     MONGO_URL = os.environ.get("MONGO_URL")
     
     if not all([API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, ADMIN_ID, MONGO_URL]):
-        raise ValueError("Kuch Environment Variables Missing hain!")
+        raise ValueError("Variables Missing!")
 except Exception as e:
-    logger.error(f"Configuration Error: {e}")
+    logger.error(f"Config Error: {e}")
     sys.exit(1)
 
-# Connection to MongoDB
+# MongoDB Connection
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL)
     db = mongo_client["filestore_bot"]
     files_col = db["files"]
     active_col = db["active_files"] 
     config_col = db["config"]
-    logger.info("MongoDB Connected Successfully!")
+    logger.info("MongoDB Connected!")
 except Exception as e:
-    logger.error(f"MongoDB Connection Failed: {e}")
+    logger.error(f"Mongo Error: {e}")
     sys.exit(1)
 
 app = Client("file_store_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Temporary storage for batch mode
 batch_data = {}
 
 async def init_db():
@@ -53,8 +52,7 @@ async def init_db():
 # --- WEB SERVER ---
 async def web_server():
     async def handle(request):
-        return web.Response(text="Bot is Running Successfully!")
-
+        return web.Response(text="Bot is Running!")
     web_app = web.Application()
     web_app.add_routes([web.get('/', handle)])
     runner = web.AppRunner(web_app)
@@ -62,20 +60,16 @@ async def web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"Web Server Started on Port {port}")
+    logger.info(f"Server on Port {port}")
 
-# --- DATABASE FUNCTIONS ---
+# --- DB FUNCTIONS ---
 
 async def get_delete_time():
     data = await config_col.find_one({"key": "del_time"})
     return data["value"] if data else 600 
 
 async def set_delete_time(seconds):
-    await config_col.update_one(
-        {"key": "del_time"}, 
-        {"$set": {"value": seconds}}, 
-        upsert=True
-    )
+    await config_col.update_one({"key": "del_time"}, {"$set": {"value": seconds}}, upsert=True)
 
 async def get_alert_msg():
     data = await config_col.find_one({"key": "alert_msg"})
@@ -83,13 +77,13 @@ async def get_alert_msg():
     return data["value"] if data else default_msg
 
 async def set_alert_msg(msg):
-    await config_col.update_one(
-        {"key": "alert_msg"}, 
-        {"$set": {"value": msg}}, 
-        upsert=True
-    )
+    await config_col.update_one({"key": "alert_msg"}, {"$set": {"value": msg}}, upsert=True)
 
 async def add_file(unique_id, message_ids, is_batch=False):
+    # Sorting: Ye line order sahi karegi (Fix for Problem 1)
+    if isinstance(message_ids, list):
+        message_ids.sort()
+        
     await files_col.insert_one({
         "unique_id": unique_id,
         "message_ids": message_ids,
@@ -114,7 +108,6 @@ async def get_expired_active_files():
 async def delete_active_entry(message_id):
     await active_col.delete_one({"message_id": message_id})
 
-# --- HELPER FUNCTIONS ---
 def encode_payload(payload: str) -> str:
     return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
 
@@ -122,7 +115,7 @@ def decode_payload(payload: str) -> str:
     padding = "=" * (4 - len(payload) % 4)
     return base64.urlsafe_b64decode(payload + padding).decode()
 
-# --- BOT COMMANDS ---
+# --- COMMANDS ---
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
@@ -146,6 +139,8 @@ async def start_command(client, message):
                     formatted_alert = raw_alert.replace("{time}", str(int(del_seconds/60)))
 
                     for mid in msg_ids:
+                        # Fix for Problem 2: Thumbnail & Caption preserved
+                        # Hum sirf copy kar rahe hain, koi change nahi
                         sent = await client.copy_message(
                             chat_id=message.chat.id,
                             from_chat_id=CHANNEL_ID,
@@ -155,63 +150,57 @@ async def start_command(client, message):
                         await asyncio.sleep(0.5)
 
                     await loading_msg.delete()
-                    
                     warning = await message.reply(formatted_alert)
                     await add_active_file(message.chat.id, warning.id, delete_at)
 
                 except Exception as e:
-                    logger.error(f"Error sending file: {e}")
-                    await message.reply("❌ Error sending files. Maybe deleted from channel.")
+                    logger.error(f"Send Error: {e}")
+                    await message.reply("❌ File deleted or channel issue.")
             else:
-                await message.reply("❌ Link expired or invalid.")
-        except Exception as e:
-            logger.error(f"Link Error: {e}")
+                await message.reply("❌ Link expired.")
+        except:
             await message.reply("❌ Invalid Link.")
     else:
-        await message.reply("👋 Welcome! Send multiple files to get links instantly.")
-
-# --- SETTINGS COMMANDS ---
+        await message.reply("👋 Welcome! Send files to store.")
 
 @app.on_message(filters.command("settime") & filters.user(ADMIN_ID))
 async def set_time_handler(client, message):
     try:
         minutes = int(message.command[1])
-        seconds = minutes * 60
-        await set_delete_time(seconds)
-        await message.reply(f"✅ User Auto-delete time set to {minutes} minutes.")
+        await set_delete_time(minutes * 60)
+        await message.reply(f"✅ Timer set: {minutes} mins.")
     except:
-        await message.reply("❌ Usage: `/settime 10`")
+        await message.reply("❌ Use: `/settime 10`")
 
 @app.on_message(filters.command("setalert") & filters.user(ADMIN_ID))
 async def set_alert_handler(client, message):
     if len(message.command) < 2:
-        await message.reply("❌ Message missing! Use: `/setalert Your Message {time} mins`")
+        await message.reply("❌ Message missing!")
         return
     new_msg = message.text.split(None, 1)[1]
     await set_alert_msg(new_msg)
-    await message.reply(f"✅ **New Alert Message Saved!**\n\nPreview:\n{new_msg}")
+    await message.reply(f"✅ Alert Saved:\n{new_msg}")
 
 # --- BATCH MODE ---
 
 @app.on_message(filters.command("batch") & filters.user(ADMIN_ID))
 async def batch_start(client, message):
     batch_data[message.from_user.id] = []
-    await message.reply("🚀 **Batch Mode Started!**\n\n1. Files Forward karein.\n2. **'✅ Added'** ka wait karein.\n3. Fir **/done** dabayein.")
+    await message.reply("🚀 **Batch Mode ON!**\nFiles bhejein. Jab sab par '✅ Added' aa jaye to **/done** dabayein.")
 
 @app.on_message(filters.command("done") & filters.user(ADMIN_ID))
 async def batch_done(client, message):
     user_id = message.from_user.id
-    
-    # Check if list exists but is empty
-    if user_id not in batch_data:
-        await message.reply("❌ Pehle `/batch` start karein.")
-        return
-        
-    if not batch_data[user_id]:
-        await message.reply("❌ **List Empty hai!**\n\nPossible Reasons:\n1. Aapne `/done` bahut jaldi daba diya (Upload finish nahi hua).\n2. Aapne 'Restricted Content' forward kiya jo Bot save nahi kar sakta.")
+    if user_id not in batch_data or not batch_data[user_id]:
+        await message.reply("❌ Empty List!")
         return
 
     msg_ids = batch_data[user_id]
+    
+    # FIX FOR PROBLEM 1: Sorting IDs
+    # Ye IDs ko 1, 2, 3 ke order mein laga dega
+    msg_ids.sort()
+
     unique_id = f"batch_{int(time.time())}_{user_id}"
     encoded_link = encode_payload(unique_id)
     bot_username = (await client.get_me()).username
@@ -221,72 +210,54 @@ async def batch_done(client, message):
     del batch_data[user_id]
     
     del_seconds = await get_delete_time()
-    await message.reply(f"✅ **Batch Created!**\n📂 Total Files: {len(msg_ids)}\n🔗 **Link:** {link}\n⏳ Expiry: {int(del_seconds/60)} mins.")
+    await message.reply(f"✅ **Batch Ready!**\n📂 Files: {len(msg_ids)}\n🔗 {link}\n⏳ Time: {int(del_seconds/60)} mins.")
 
-# --- CONTENT HANDLER (SMART FEEDBACK) ---
-@app.on_message(
-    (filters.document | filters.video | filters.photo | filters.audio | filters.text) 
-    & filters.private
-)
+# --- HANDLER ---
+
+@app.on_message((filters.document | filters.video | filters.photo | filters.audio | filters.text) & filters.private)
 async def content_handler(client, message):
-    if message.command: return 
+    if message.command or message.from_user.id != ADMIN_ID: return 
 
-    if message.from_user.id != ADMIN_ID: return 
-
-    # BATCH MODE
     if message.from_user.id in batch_data:
         try:
-            # Step 1: Forwarding (Time taking process)
             forwarded = await message.forward(CHANNEL_ID)
-            
-            # Step 2: Check if batch still exists
             if message.from_user.id in batch_data:
                 batch_data[message.from_user.id].append(forwarded.id)
-                # FEEDBACK: User ko batao ki file add ho gayi
                 await message.reply("✅ Added", quote=True)
-            else:
-                pass 
         except Exception as e:
-            logger.error(f"Batch Error: {e}")
-            await message.reply(f"❌ Failed to Add: {e}\n(Shayad Restricted Content hai)", quote=True)
+            logger.error(f"Err: {e}")
         return
 
-    # NORMAL MODE (SINGLE LINK)
     try:
         forwarded = await message.forward(CHANNEL_ID)
-        msg_id = forwarded.id
-        unique_id = f"file_{msg_id}"
-        encoded_link = encode_payload(unique_id)
-        bot_username = (await client.get_me()).username
-        link = f"https://t.me/{bot_username}?start={encoded_link}"
-        
-        await add_file(unique_id, [msg_id], is_batch=False)
+        unique_id = f"file_{forwarded.id}"
+        link = f"https://t.me/{(await client.get_me()).username}?start={encode_payload(unique_id)}"
+        await add_file(unique_id, [forwarded.id])
         await message.reply(f"🔗 {link}", quote=True)
-        
     except Exception as e:
         await message.reply(f"❌ Error: {e}")
 
-# --- AUTO DELETE LOOP ---
+# --- AUTO DELETE ---
 async def auto_delete_loop():
     while True:
         try:
-            expired_files = await get_expired_active_files()
-            if expired_files:
-                for file_data in expired_files:
+            expired = await get_expired_active_files()
+            if expired:
+                for f in expired:
                     try:
-                        await app.delete_messages(file_data["user_id"], file_data["message_id"])
+                        await app.delete_messages(f["user_id"], f["message_id"])
                     except: pass
-                    await delete_active_entry(file_data["message_id"])
+                    await delete_active_entry(f["message_id"])
         except: pass    
         await asyncio.sleep(60)
 
 # --- MAIN ---
 async def main():
     await init_db()
-    logger.info("Starting Web Server & Bot...")
+    logger.info("Bot Starting...")
     await web_server()
     await app.start()
-    logger.info("Bot Started Successfully!")
+    logger.info("Bot Started!")
     asyncio.create_task(auto_delete_loop())
     await idle()
     await app.stop()
