@@ -5,6 +5,7 @@ import time
 import logging
 import sys
 from pyrogram import Client, filters, idle
+from pyrogram.enums import MessageMediaType
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
 
@@ -80,6 +81,9 @@ async def set_alert_msg(msg):
     await config_col.update_one({"key": "alert_msg"}, {"$set": {"value": msg}}, upsert=True)
 
 async def add_file(unique_id, message_ids, is_batch=False):
+    # Sorting IDs numerically
+    if isinstance(message_ids, list):
+        message_ids.sort()
     await files_col.insert_one({
         "unique_id": unique_id,
         "message_ids": message_ids,
@@ -111,6 +115,55 @@ def decode_payload(payload: str) -> str:
     padding = "=" * (4 - len(payload) % 4)
     return base64.urlsafe_b64decode(payload + padding).decode()
 
+# --- SMART SENDER (THUMBNAIL FIXER) ---
+async def send_file_smartly(client, chat_id, message_id):
+    """
+    Ye function file ko 'Copy' karne ki jagah 'File ID' se bhejega.
+    Isse Thumbnail 100% waisa hi rehta hai.
+    """
+    try:
+        # Message fetch karo
+        msg = await client.get_messages(CHANNEL_ID, message_id)
+        
+        sent = None
+        caption = msg.caption if msg.caption else ""
+        
+        # Check karo file type kya hai aur usi hisaab se bhejo
+        if msg.media == MessageMediaType.VIDEO:
+            sent = await client.send_video(
+                chat_id=chat_id,
+                video=msg.video.file_id,
+                caption=caption,
+                supports_streaming=True
+            )
+        elif msg.media == MessageMediaType.DOCUMENT:
+            sent = await client.send_document(
+                chat_id=chat_id,
+                document=msg.document.file_id,
+                caption=caption
+            )
+        elif msg.media == MessageMediaType.AUDIO:
+            sent = await client.send_audio(
+                chat_id=chat_id,
+                audio=msg.audio.file_id,
+                caption=caption
+            )
+        elif msg.media == MessageMediaType.PHOTO:
+            sent = await client.send_photo(
+                chat_id=chat_id,
+                photo=msg.photo.file_id,
+                caption=caption
+            )
+        else:
+            # Agar koi aur type hai (Text/Sticker) to Normal Copy use karo
+            sent = await msg.copy(chat_id)
+            
+        return sent
+    except Exception as e:
+        logger.error(f"Smart Send Error: {e}")
+        # Agar Smart Send fail ho to Fallback 'Copy' par jao
+        return await client.copy_message(chat_id, CHANNEL_ID, message_id)
+
 # --- COMMANDS ---
 
 @app.on_message(filters.command("start") & filters.private)
@@ -135,13 +188,11 @@ async def start_command(client, message):
                     formatted_alert = raw_alert.replace("{time}", str(int(del_seconds/60)))
 
                     for mid in msg_ids:
-                        # THUMBNAIL FIX: Original message ko bina chhede copy karo
-                        sent = await client.copy_message(
-                            chat_id=message.chat.id,
-                            from_chat_id=CHANNEL_ID,
-                            message_id=int(mid)
-                        )
-                        await add_active_file(message.chat.id, sent.id, delete_at)
+                        # Use SMART SENDER instead of Copy
+                        sent = await send_file_smartly(client, message.chat.id, int(mid))
+                        
+                        if sent:
+                            await add_active_file(message.chat.id, sent.id, delete_at)
                         await asyncio.sleep(0.5)
 
                     await loading_msg.delete()
@@ -176,7 +227,7 @@ async def set_alert_handler(client, message):
     await set_alert_msg(new_msg)
     await message.reply(f"✅ Alert Saved:\n{new_msg}")
 
-# --- BATCH MODE WITH NAME SORTING ---
+# --- BATCH MODE ---
 
 @app.on_message(filters.command("batch") & filters.user(ADMIN_ID))
 async def batch_start(client, message):
@@ -192,34 +243,23 @@ async def batch_done(client, message):
 
     msg_ids = batch_data[user_id]
     
-    # --- NAME SORTING LOGIC START ---
-    status_msg = await message.reply("⚙️ **Sorting files by Name...**")
-    
+    # Sorting by Name
+    status_msg = await message.reply("⚙️ **Sorting files...**")
     try:
-        # Channel se actual messages fetch karo taaki naam padh sakein
         msgs = await client.get_messages(CHANNEL_ID, msg_ids)
-        if not isinstance(msgs, list):
-            msgs = [msgs]
+        if not isinstance(msgs, list): msgs = [msgs]
             
-        # Helper function: File ka naam nikalne ke liye
         def get_file_name(m):
             if m.document and m.document.file_name: return m.document.file_name
             if m.video and m.video.file_name: return m.video.file_name
             if m.audio and m.audio.file_name: return m.audio.file_name
-            if m.caption: return m.caption # Agar file name nahi hai to caption use karo
-            return "" # Kuch nahi mila
+            if m.caption: return m.caption 
+            return ""
 
-        # Sort karo (Alphabetical Order: A -> Z)
         msgs_sorted = sorted(msgs, key=lambda m: get_file_name(m))
-        
-        # Ab naye sorted IDs nikalo
         sorted_msg_ids = [m.id for m in msgs_sorted]
     except Exception as e:
-        logger.error(f"Sort Error: {e}")
-        # Agar sorting fail ho jaye to normal ID sort use karo
         sorted_msg_ids = sorted(msg_ids)
-
-    # --- NAME SORTING LOGIC END ---
 
     unique_id = f"batch_{int(time.time())}_{user_id}"
     encoded_link = encode_payload(unique_id)
@@ -232,7 +272,7 @@ async def batch_done(client, message):
     del_seconds = await get_delete_time()
     await status_msg.edit(
         f"✅ **Batch Created & Sorted!**\n"
-        f"📂 Total Files: {len(sorted_msg_ids)}\n"
+        f"📂 Files: {len(sorted_msg_ids)}\n"
         f"🔗 **Link:** {link}\n"
         f"⏳ Time: {int(del_seconds/60)} mins."
     )
