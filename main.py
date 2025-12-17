@@ -80,8 +80,18 @@ async def get_alert_msg():
 async def set_alert_msg(msg):
     await config_col.update_one({"key": "alert_msg"}, {"$set": {"value": msg}}, upsert=True)
 
+# THUMBNAIL DB FUNCTIONS
+async def set_custom_thumbnail(file_id):
+    await config_col.update_one({"key": "custom_thumb"}, {"$set": {"value": file_id}}, upsert=True)
+
+async def get_custom_thumbnail():
+    data = await config_col.find_one({"key": "custom_thumb"})
+    return data["value"] if data else None
+
+async def delete_custom_thumbnail():
+    await config_col.delete_one({"key": "custom_thumb"})
+
 async def add_file(unique_id, message_ids, is_batch=False):
-    # Sorting IDs numerically
     if isinstance(message_ids, list):
         message_ids.sort()
     await files_col.insert_one({
@@ -115,59 +125,63 @@ def decode_payload(payload: str) -> str:
     padding = "=" * (4 - len(payload) % 4)
     return base64.urlsafe_b64decode(payload + padding).decode()
 
-# --- SMART SENDER (THUMBNAIL FIXER) ---
+# --- SENDER LOGIC (Thumbnail System) ---
 async def send_file_smartly(client, chat_id, message_id):
-    """
-    Ye function file ko 'Copy' karne ki jagah 'File ID' se bhejega.
-    Isse Thumbnail 100% waisa hi rehta hai.
-    """
     try:
-        # Message fetch karo
         msg = await client.get_messages(CHANNEL_ID, message_id)
-        
         sent = None
         caption = msg.caption if msg.caption else ""
         
-        # Check karo file type kya hai aur usi hisaab se bhejo
+        # Check Custom Thumbnail
+        custom_thumb_id = await get_custom_thumbnail()
+        thumb_path = None
+        
+        if custom_thumb_id:
+            try:
+                thumb_path = await client.download_media(custom_thumb_id)
+            except:
+                thumb_path = None
+
+        # SENDING LOGIC
         if msg.media == MessageMediaType.VIDEO:
             sent = await client.send_video(
                 chat_id=chat_id,
                 video=msg.video.file_id,
                 caption=caption,
+                thumb=thumb_path if thumb_path else None, # Apply Custom Thumb
                 supports_streaming=True
             )
         elif msg.media == MessageMediaType.DOCUMENT:
             sent = await client.send_document(
                 chat_id=chat_id,
                 document=msg.document.file_id,
-                caption=caption
+                caption=caption,
+                thumb=thumb_path if thumb_path else None
             )
         elif msg.media == MessageMediaType.AUDIO:
             sent = await client.send_audio(
                 chat_id=chat_id,
                 audio=msg.audio.file_id,
-                caption=caption
-            )
-        elif msg.media == MessageMediaType.PHOTO:
-            sent = await client.send_photo(
-                chat_id=chat_id,
-                photo=msg.photo.file_id,
-                caption=caption
+                caption=caption,
+                thumb=thumb_path if thumb_path else None
             )
         else:
-            # Agar koi aur type hai (Text/Sticker) to Normal Copy use karo
             sent = await msg.copy(chat_id)
+            
+        # Cleanup downloaded thumb
+        if thumb_path and os.path.exists(thumb_path):
+            os.remove(thumb_path)
             
         return sent
     except Exception as e:
-        logger.error(f"Smart Send Error: {e}")
-        # Agar Smart Send fail ho to Fallback 'Copy' par jao
+        logger.error(f"Send Error: {e}")
         return await client.copy_message(chat_id, CHANNEL_ID, message_id)
 
 # --- COMMANDS ---
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
+    # 1. LINK PROCESSING (Agar link hai)
     if len(message.command) > 1:
         payload = message.command[1]
         try:
@@ -188,9 +202,8 @@ async def start_command(client, message):
                     formatted_alert = raw_alert.replace("{time}", str(int(del_seconds/60)))
 
                     for mid in msg_ids:
-                        # Use SMART SENDER instead of Copy
+                        # Smart Sender Use karega (Thumbnail ke sath)
                         sent = await send_file_smartly(client, message.chat.id, int(mid))
-                        
                         if sent:
                             await add_active_file(message.chat.id, sent.id, delete_at)
                         await asyncio.sleep(0.5)
@@ -206,8 +219,32 @@ async def start_command(client, message):
                 await message.reply("❌ Link expired.")
         except:
             await message.reply("❌ Invalid Link.")
+    
+    # 2. NORMAL WELCOME (Security Fix)
     else:
-        await message.reply("👋 Welcome! Send files to store.")
+        # Agar Admin hai to Options dikhao
+        if message.from_user.id == ADMIN_ID:
+            await message.reply("👋 **Hello Admin!**\n\n- Send Files to Store.\n- Use `/batch` for multiple.\n- Reply `/setthumb` to a photo to set Thumbnail.")
+        else:
+            # Agar Normal User hai to UPLOAD KA OPTION MAT DIKHAO
+            await message.reply("👋 **Welcome to File Store!**\n\nI can provide you secure files with auto-delete functionality.")
+
+# --- ADMIN SETTINGS ---
+
+@app.on_message(filters.command("setthumb") & filters.user(ADMIN_ID))
+async def set_thumb_handler(client, message):
+    if not message.reply_to_message or not message.reply_to_message.photo:
+        await message.reply("❌ **Error:** Kisi PHOTO par reply karke `/setthumb` likhein.")
+        return
+    
+    file_id = message.reply_to_message.photo.file_id
+    await set_custom_thumbnail(file_id)
+    await message.reply("✅ **Custom Thumbnail Set!**\nAb saari videos par yahi photo dikhegi.")
+
+@app.on_message(filters.command("delthumb") & filters.user(ADMIN_ID))
+async def del_thumb_handler(client, message):
+    await delete_custom_thumbnail()
+    await message.reply("🗑️ **Thumbnail Removed!**\nAb original video thumbnail dikhega.")
 
 @app.on_message(filters.command("settime") & filters.user(ADMIN_ID))
 async def set_time_handler(client, message):
@@ -232,18 +269,18 @@ async def set_alert_handler(client, message):
 @app.on_message(filters.command("batch") & filters.user(ADMIN_ID))
 async def batch_start(client, message):
     batch_data[message.from_user.id] = []
-    await message.reply("🚀 **Batch Mode ON!**\n\n1. Files Forward karein.\n2. **'✅ Added'** ka wait karein.\n3. Fir **/done** dabayein.")
+    await message.reply("🚀 **Batch Mode ON!**\nSend files. Wait for '✅ Added', then type **/done**.")
 
 @app.on_message(filters.command("done") & filters.user(ADMIN_ID))
 async def batch_done(client, message):
     user_id = message.from_user.id
     if user_id not in batch_data or not batch_data[user_id]:
-        await message.reply("❌ List Empty! Pehle files bhejein.")
+        await message.reply("❌ Empty List!")
         return
 
     msg_ids = batch_data[user_id]
     
-    # Sorting by Name
+    # Sorting
     status_msg = await message.reply("⚙️ **Sorting files...**")
     try:
         msgs = await client.get_messages(CHANNEL_ID, msg_ids)
@@ -270,18 +307,18 @@ async def batch_done(client, message):
     del batch_data[user_id]
     
     del_seconds = await get_delete_time()
-    await status_msg.edit(
-        f"✅ **Batch Created & Sorted!**\n"
-        f"📂 Files: {len(sorted_msg_ids)}\n"
-        f"🔗 **Link:** {link}\n"
-        f"⏳ Time: {int(del_seconds/60)} mins."
-    )
+    await status_msg.edit(f"✅ **Batch Created!**\n📂 Files: {len(sorted_msg_ids)}\n🔗 {link}\n⏳ Time: {int(del_seconds/60)} mins.")
 
 # --- HANDLER ---
 
 @app.on_message((filters.document | filters.video | filters.photo | filters.audio | filters.text) & filters.private)
 async def content_handler(client, message):
-    if message.command or message.from_user.id != ADMIN_ID: return 
+    if message.command: return 
+    
+    # SECURITY: Only Admin Can Store Files
+    if message.from_user.id != ADMIN_ID:
+        # Ignore normal users
+        return 
 
     if message.from_user.id in batch_data:
         try:
